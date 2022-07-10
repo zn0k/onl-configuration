@@ -38,7 +38,10 @@ current_bundles = set(map(
 ))
 
 # get the declared bundles
-declared_bundles = set(map(lambda x: x["name"], lacp_config))
+declared_bundles = set(map(
+    lambda x: x["name"], 
+    lacp_config
+))
 
 # remove all the bundles that shouldn't exist anymore
 for bundle in (current_bundles - declared_bundles):
@@ -68,8 +71,8 @@ for bundle in lacp_config:
     # grab the index for easy reference
     master_idx = ndb.interfaces[bundle["name"]]["index"]
 
-    # remember all bundle members so they can be skipped in future 
-    # layer 2 or 3 interface configurations
+    # remember all bundle members so they can be skipped in  
+    # future layer 2 or 3 interface configurations
     lacp_members.update(bundle["members"])
 
     # grab all interfaces currently part of this bundle
@@ -172,7 +175,7 @@ for interface in config["interfaces"]:
     # check if the interface is a layer 2 port
     if "vlans" in interface and len(interface["vlans"]):
         # it is, add it to the appropriate bridge if needed
-        bridge_name = (interface["virtual_switch"] if "virtual_switch" in interface else "default-switch")
+        bridge_name = interface["virtual_switch"] if "virtual_switch" in interface else "default-switch"
         bridge_idx = ndb.interfaces[bridge_name]["index"]
         if ndb.interfaces[interface["name"]]["master"] != bridge_idx:
             (ndb
@@ -206,3 +209,6 @@ ndb.close()
 #    for vlan in configuration list
 #        if vlan not operationally set as tagged
 #            add tagged vlan
+#    if voice vlan exists
+#        if voice vlan is incorrect
+#            set voice vlan
