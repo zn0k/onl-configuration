@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import yaml
-from pyroute2 import NDB
+from pyroute2 import NDB, IPRoute
 import argparse
 
 parser = argparse.ArgumentParser(description="Configure ONL device interfaces and routing")
@@ -195,6 +195,36 @@ for interface in config["interfaces"]:
             .commit()
         )
         print(f"Set interface {interface['name']} state to {state}")
+
+# VLAN membership of interfaces must be handled via the IPRoute module
+ipr = IPRoute()
+
+# helper function to retrieve NTLM attributes of a certain kind
+# from the large list of attributes an interface might have
+def _get_attribute(search_key, attrs):
+    result = []
+    for (key, value) in attrs:
+        if search_key == key:
+            result.append(value)
+    return result
+
+# function to retrieve the current VLANs on an interface
+def get_vlans(ifname):
+    vlans = []
+    for interface in ipr.get_vlans():
+        candidate_name = _get_attribute("IFLA_IFNAME", interface["attrs"])[0]
+        if candidate_name == ifname:
+            spec = _get_attribute("IFLA_AF_SPEC", interface["attrs"])[0]
+            return _get_attribute("IFLA_BRIDGE_VLAN_INFO", spec["attrs"])
+
+
+# add two tagged VLANs. flag 0 = tagged
+#ip.vlan_filter("add", index=ip.link_lookup(ifname='swp3')[0], vlan_info={"vid": 888, "flags": 0})
+#ip.vlan_filter("add", index=ip.link_lookup(ifname='swp3')[0], vlan_info={"vid": 989, "flags": 0})
+# can check result on shell via "bridge vlan show"
+# remove one of them
+#ip.vlan_filter("del", index=ip.link_lookup(ifname='swp3')[0], vlan_info={"vid": 888, "flags": 0})
+
 
 ndb.close()
 
