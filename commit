@@ -2,29 +2,69 @@
 
 import yaml
 from pyroute2 import NDB
+import argparse
+
+parser = argparse.ArgumentParser(description="Configure ONL device interfaces and routing")
+parser.add_argument("--config", type=str, help="Configuration file to load", default="config.yml")
+args = parser.parse_args()
 
 ndb = NDB()
 
-with open("config.yml", "r") as f:
+with open(args.config, "r") as f:
     config = yaml.load(f, Loader=yaml.Loader)
 
 # configure LACP bundles
-lacp_members = set()
-for bundle in config["lacp"]:
-    # check that the bundle already exists
-    if bundle["name"] not in ndb.interfaces:
-        # it does not, create it
-        (ndb
-            .interfaces
-            .create(
-                ifname=bundle["name"],
-                kind="bond",
-                bond_mode=4,
-            )
-            .commit()
-        )
-        print(f"Created new LACP bundle {bundle['name']}")
+# parse the interface configuration for such bundles,
+# assembling a data structure to describe them:
+# lacp_config = [
+#   {"name": "bond1", "members": ["swp1", "swp2"]}
+# ]
+lacp_config = {}
+for interface in config["interfaces"]:
+    if "lacp" in interface:
+        if interface["lacp"] in lacp_config:
+            lacp_config[interface["lacp"]].append(interface["name"])
+        else:
+            lacp_config[interface["lacp"]] = [interface["name"]]
+lacp_config = [{"name": name, "members": lacp_config[name]} for name in lacp_config.keys()]
 
+# retrieve all existing LACP bundles
+current_bundles = set(map(
+    lambda x: x["ifname"],
+    ndb.interfaces
+        .dump()
+        .filter(lambda x: x.kind == "bond")
+        .select("ifname")
+))
+
+# get the declared bundles
+declared_bundles = set(map(lambda x: x["name"], lacp_config))
+
+# remove all the bundles that shouldn't exist anymore
+for bundle in (current_bundles - declared_bundles):
+    (ndb
+        .interfaces[bundle]
+        .remove()
+        .commit()
+    )
+    print(f"Removed existing LACP bundle {bundle} that is no longer present in configuration")
+
+# create all the new bundles that don't exist yet
+for bundle in (declared_bundles - current_bundles):
+    (ndb
+        .interfaces
+        .create(
+            ifname=bundle,
+            kind="bond",
+            bond_mode=4, # LACP
+        )
+        .commit()
+    )
+    print(f"Created new LACP bundle {bundle}")
+
+# now process all the member interfaces
+lacp_members = set()
+for bundle in lacp_config:
     # grab the index for easy reference
     master_idx = ndb.interfaces[bundle["name"]]["index"]
 
@@ -51,7 +91,7 @@ for bundle in config["lacp"]:
             .del_port(member)
             .commit()
         )
-        print(f"Deleted bundle member {member}")
+        print(f"Deleted member {member} from bundle {bundle['name']}")
 
     # add all the members that should be in the bundle but aren't yet
     members_to_add = declared_members - current_members
@@ -70,23 +110,25 @@ for bundle in config["lacp"]:
         for member in members_to_add:
             # for this, the new member has to be down
             previous_state = ndb.interfaces[member]["state"]
-            (ndb
-                .interfaces[member]
-                .set("state", "down")
-                .commit()
-            )
+            if previous_state != "down":
+                (ndb
+                    .interfaces[member]
+                    .set("state", "down")
+                    .commit()
+                )
             # add it to the bundle
             (ndb
                 .interfaces[bundle["name"]]
                 .add_port(member)
                 .commit()
             )
-            # restore the previous state
-            (ndb
-                .interfaces[member]
-                .set("state", previous_state)
-                .commit()
-            )
+            # restore the previous state if it wasn't down
+            if previous_state != "down":
+                (ndb
+                    .interfaces[member]
+                    .set("state", previous_state)
+                    .commit()
+                )
             print(f"Added member {member} to bundle {bundle['name']}")
         # and restore the upstream master if needed
         if upstream_master:
@@ -119,7 +161,9 @@ for virtual_switch in virtual_switches:
         )
         print(f"Created VLAN capable switch {virtual_switch}")
 
-# configure the switchports
+# configure the switchports, except for VLAN membership, which is done below
+# NDB does not support VLAN filters at this time, so that step
+# has to be performed via the IPRoute interface instead
 for interface in config["interfaces"]:
     # force skipping LACP members
     if interface["name"] in lacp_members:
@@ -127,23 +171,31 @@ for interface in config["interfaces"]:
 
     # check if the interface is a layer 2 port
     if "vlans" in interface and len(interface["vlans"]):
-        # it is, add it to the appropriate bridge
+        # it is, add it to the appropriate bridge if needed
         bridge_name = (interface["virtual_switch"] if "virtual_switch" in interface else "default-switch")
+        bridge_idx = ndb.interfaces[bridge_name]["index"]
+        if ndb.interfaces[interface["name"]]["master"] != bridge_idx:
+            (ndb
+                .interfaces[bridge_name]
+                .add_port(interface["name"])
+                .commit()
+            )
+            print(f"Added interface {interface['name']} to bridge {bridge_name}")
+
+    # configure the up/down state
+    # default to down if not specified
+    state = "up" if "enabled" in interface and interface["enabled"] else "down"
+    if ndb.interfaces[interface["name"]]["state"] != state:
         (ndb
-            .interfaces[bridge_name]
-            .add_port(interface["name"])
+            .interfaces[interface["name"]]
+            .set("state", state)
             .commit()
         )
-
+        print(f"Set interface {interface['name']} state to {state}")
 
 ndb.close()
 
 
-## set interfaces to layer 2
-#for interface in interfaces
-#    if interface is switched
-#        set master to default-switch bridge
-#
 ## set VLANs
 #for interface in interfaces
 #    if untagged VLAN is incorrect
@@ -154,10 +206,3 @@ ndb.close()
 #    for vlan in configuration list
 #        if vlan not operationally set as tagged
 #            add tagged vlan
-#
-## set state
-#for interface in interfaces
-#    if state is admin down
-#        set state down
-#    else
-#        set state up
