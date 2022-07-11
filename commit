@@ -164,41 +164,6 @@ for virtual_switch in virtual_switches:
         )
         print(f"Created VLAN capable switch {virtual_switch}")
 
-# configure the switchports, except for VLAN membership, which is done below
-# NDB does not support VLAN filters at this time, so that step
-# has to be performed via the IPRoute interface instead
-for interface in config["interfaces"]:
-    # force skipping LACP members
-    if interface["name"] in lacp_members:
-        continue
-
-    # check if the interface is a layer 2 port
-    if "vlans" in interface and len(interface["vlans"]):
-        # it is, add it to the appropriate bridge if needed
-        bridge_name = interface["virtual_switch"] if "virtual_switch" in interface else "default-switch"
-        bridge_idx = ndb.interfaces[bridge_name]["index"]
-        if ndb.interfaces[interface["name"]]["master"] != bridge_idx:
-            (ndb
-                .interfaces[bridge_name]
-                .add_port(interface["name"])
-                .commit()
-            )
-            print(f"Added interface {interface['name']} to bridge {bridge_name}")
-
-    # configure the up/down state
-    # default to down if not specified
-    state = "up" if "enabled" in interface and interface["enabled"] else "down"
-    if ndb.interfaces[interface["name"]]["state"] != state:
-        (ndb
-            .interfaces[interface["name"]]
-            .set("state", state)
-            .commit()
-        )
-        print(f"Set interface {interface['name']} state to {state}")
-
-# VLAN membership of interfaces must be handled via the IPRoute module
-ipr = IPRoute()
-
 # helper function to retrieve NTLM attributes of a certain kind
 # from the large list of attributes an interface might have
 def _get_attribute(search_key, attrs):
@@ -217,14 +182,78 @@ def get_vlans(ifname):
             spec = _get_attribute("IFLA_AF_SPEC", interface["attrs"])[0]
             return _get_attribute("IFLA_BRIDGE_VLAN_INFO", spec["attrs"])
 
+# parse the VLANs into a data structure where VIDs can be looked up by name
+vlans = {x["id"]: x["name"] for x in config["vlans"]}
+
+# configure the switchports
+# NDB does not support VLAN filters at this time, so that step
+# has to be performed via the IPRoute interface instead
+ipr = IPRoute()
+
+for interface in config["interfaces"]:
+    # force skipping LACP members
+    if interface["name"] in lacp_members:
+        continue
+
+    # get the interface index for easy access in later operations
+    interface_idx = ndb.interfaces[interface["name"]]["index"]
+
+    # check if the interface is a layer 2 port
+    if "l3" not in interface or (not len(interface["l3"]["ipv4"] and not len(interface["l3"]["ipv6"]))):
+        # it is, add it to the appropriate bridge if needed
+        bridge_name = interface["virtual_switch"] if "virtual_switch" in interface else "default-switch"
+        bridge_idx = ndb.interfaces[bridge_name]["index"]
+        if ndb.interfaces[interface["name"]]["master"] != bridge_idx:
+            (ndb
+                .interfaces[bridge_name]
+                .add_port(interface["name"])
+                .commit()
+            )
+            print(f"Added interface {interface['name']} to bridge {bridge_name}")
+        
+        current_vlans = get_vlans(interface["name"])
+        # set the untagged VLAN
+        current_untagged = set(filter(lambda x: x["flags"] == 6, current_vlans))
+        if "untagged_vlan" in interface:
+            declared_untagged = set([{"flags": 6, "vid": vlans[interface["untagged_vlan"]]}])
+        else:
+            declared_untagged = set()
+        # remove any unneeded untagged VLAN
+        for untagged in (current_untagged - declared_untagged):
+            ipr.vlan_filter(
+                "del",
+                index=interface_idx,
+                vlan_info=untagged,
+            )
+        # and add the new one
+        for untagged in (declared_tagged - current_untagged):
+            ipr.vlan_filter(
+                "add",
+                index=interface_idx,
+                vlan_info=untagged,
+            )
+
+        # do the same for tagged VLANs
+
+    # configure the up/down state
+    # default to down if not specified
+    state = "up" if "enabled" in interface and interface["enabled"] else "down"
+    if ndb.interfaces[interface["name"]]["state"] != state:
+        (ndb
+            .interfaces[interface["name"]]
+            .set("state", state)
+            .commit()
+        )
+        print(f"Set interface {interface['name']} state to {state}")
 
 # add two tagged VLANs. flag 0 = tagged
-#ip.vlan_filter("add", index=ip.link_lookup(ifname='swp3')[0], vlan_info={"vid": 888, "flags": 0})
-#ip.vlan_filter("add", index=ip.link_lookup(ifname='swp3')[0], vlan_info={"vid": 989, "flags": 0})
+ipr.vlan_filter("add", index=ipr.link_lookup(ifname='swp3')[0], vlan_info={"vid": 10, "flags": 0})
+ipr.vlan_filter("add", index=ipr.link_lookup(ifname='swp3')[0], vlan_info={"vid": 20, "flags": 0})
 # can check result on shell via "bridge vlan show"
 # remove one of them
 #ip.vlan_filter("del", index=ip.link_lookup(ifname='swp3')[0], vlan_info={"vid": 888, "flags": 0})
 
+print(get_vlans("swp3"))
 
 ndb.close()
 
