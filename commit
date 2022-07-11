@@ -60,6 +60,7 @@ for bundle in (declared_bundles - current_bundles):
             ifname=bundle,
             kind="bond",
             bond_mode=4, # LACP
+            bond_ad_lacp_rate=1, # LACP rate fast
         )
         .commit()
     )
@@ -180,10 +181,11 @@ def get_vlans(ifname):
         candidate_name = _get_attribute("IFLA_IFNAME", interface["attrs"])[0]
         if candidate_name == ifname:
             spec = _get_attribute("IFLA_AF_SPEC", interface["attrs"])[0]
-            return _get_attribute("IFLA_BRIDGE_VLAN_INFO", spec["attrs"])
+            vlans = _get_attribute("IFLA_BRIDGE_VLAN_INFO", spec["attrs"])
+    return list(map(lambda x: {"flags": x["flags"], "vid": x["vid"]}, vlans))
 
 # parse the VLANs into a data structure where VIDs can be looked up by name
-vlans = {x["id"]: x["name"] for x in config["vlans"]}
+vlans = {x["name"]: x["id"] for x in config["vlans"]}
 
 # configure the switchports
 # NDB does not support VLAN filters at this time, so that step
@@ -199,7 +201,7 @@ for interface in config["interfaces"]:
     interface_idx = ndb.interfaces[interface["name"]]["index"]
 
     # check if the interface is a layer 2 port
-    if "l3" not in interface or (not len(interface["l3"]["ipv4"] and not len(interface["l3"]["ipv6"]))):
+    if "l3" not in interface:
         # it is, add it to the appropriate bridge if needed
         bridge_name = interface["virtual_switch"] if "virtual_switch" in interface else "default-switch"
         bridge_idx = ndb.interfaces[bridge_name]["index"]
@@ -211,29 +213,47 @@ for interface in config["interfaces"]:
             )
             print(f"Added interface {interface['name']} to bridge {bridge_name}")
         
-        current_vlans = get_vlans(interface["name"])
-        # set the untagged VLAN
-        current_untagged = set(filter(lambda x: x["flags"] == 6, current_vlans))
-        if "untagged_vlan" in interface:
-            declared_untagged = set([{"flags": 6, "vid": vlans[interface["untagged_vlan"]]}])
-        else:
-            declared_untagged = set()
-        # remove any unneeded untagged VLAN
-        for untagged in (current_untagged - declared_untagged):
-            ipr.vlan_filter(
-                "del",
-                index=interface_idx,
-                vlan_info=untagged,
-            )
-        # and add the new one
-        for untagged in (declared_tagged - current_untagged):
-            ipr.vlan_filter(
-                "add",
-                index=interface_idx,
-                vlan_info=untagged,
-            )
+        # process tagged and untagged VLANs. tagged has a flag of 0, untagged is 6
+        # to this in a loop since all the other code is duplicated
+        # if a voice VLAN is set, and it to the tagged list if it isn't in there yet
+        tagged_vlans = interface["tagged_vlans"] if "tagged_vlans" in interface else []
+        if "voice_vlan" in interface:
+            if interface["voice_vlan"] not in tagged_vlans:
+                tagged_vlans.append(interface["voice_vlan"])
 
-        # do the same for tagged VLANs
+        # retrieve the current untagged and tagged VLANs for the interface
+        current_vlans = get_vlans(interface["name"])
+        # turn them into a set of tuples so they can be used in sets
+        current_vlans = list(map(lambda x: (x["flags"], x["vid"]), current_vlans))
+
+        for mode in [(6, "untagged_vlan"), (0, "tagged_vlans")]:
+            description = mode[1].replace("_vlans", "").replace("_vlan", "")
+            # fetch what is currenly in place
+            current = set(filter(lambda x: x[0] == mode[0], current_vlans))
+            if mode[1] in interface:
+                if mode[1] == "untagged_vlan":
+                    declared = set([(6, vlans[interface["untagged_vlan"]])])
+                else:
+                    declared = set([(0, vlans[x]) for x in tagged_vlans])
+                declared = set(declared)
+            else:
+                declared = set()
+            # remove any unneeded configuration
+            for vlan_info in (current - declared):
+                ipr.vlan_filter(
+                    "del",
+                    index=interface_idx,
+                    vlan_info={"flags": vlan_info[0], "vid": vlan_info[1]},
+                )
+                print(f"Removed {description} VLAN {vlan_info[1]} from interface {interface['name']}")
+            # and add the new one
+            for vlan_info in (declared - current):
+                ipr.vlan_filter(
+                    "add",
+                    index=interface_idx,
+                    vlan_info={"flags": vlan_info[0], "vid": vlan_info[1]},
+                )
+                print(f"Added {description} VLAN {vlan_info[1]} to interface {interface['name']}")
 
     # configure the up/down state
     # default to down if not specified
@@ -246,28 +266,4 @@ for interface in config["interfaces"]:
         )
         print(f"Set interface {interface['name']} state to {state}")
 
-# add two tagged VLANs. flag 0 = tagged
-ipr.vlan_filter("add", index=ipr.link_lookup(ifname='swp3')[0], vlan_info={"vid": 10, "flags": 0})
-ipr.vlan_filter("add", index=ipr.link_lookup(ifname='swp3')[0], vlan_info={"vid": 20, "flags": 0})
-# can check result on shell via "bridge vlan show"
-# remove one of them
-#ip.vlan_filter("del", index=ip.link_lookup(ifname='swp3')[0], vlan_info={"vid": 888, "flags": 0})
-
-print(get_vlans("swp3"))
-
 ndb.close()
-
-
-## set VLANs
-#for interface in interfaces
-#    if untagged VLAN is incorrect
-#        set untagged VLAN
-#    for vlan in operationally set as tagged
-#        if vlan not in configuration list
-#            delete tagged vlan
-#    for vlan in configuration list
-#        if vlan not operationally set as tagged
-#            add tagged vlan
-#    if voice vlan exists
-#        if voice vlan is incorrect
-#            set voice vlan
