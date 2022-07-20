@@ -157,6 +157,7 @@ for virtual_switch in virtual_switches:
             .create(
                 ifname=virtual_switch,
                 kind="bridge",
+                state="up",
                 br_vlan_filtering=1,
                 br_vlan_default_pvid=1,
                 br_vlan_stats_enabled=1,
@@ -164,6 +165,15 @@ for virtual_switch in virtual_switches:
             .commit()
         )
         print(f"Created VLAN capable switch {virtual_switch}")
+    else:
+        # if the bridge already exists, ensure the interface is up
+        if ndb.interfaces[virtual_switch]["state"] != "up":
+            (ndb
+                .interfaces[virtual_switch]
+                .set("state", "up")
+                .commit()
+            )
+            print(f"Enabled virtual switch {virtual_switch}")
 
 # helper function to retrieve NTLM attributes of a certain kind
 # from the large list of attributes an interface might have
@@ -175,6 +185,8 @@ def _get_attribute(search_key, attrs):
     return result
 
 # function to retrieve the current VLANs on an interface
+# this uses the IPRoute interface as ndb.vlans.summary() doesn't
+# include VLAN flags, which is how tagged vs untagged is set
 def get_vlans(ifname):
     vlans = []
     for interface in ipr.get_vlans():
@@ -186,6 +198,29 @@ def get_vlans(ifname):
 
 # parse the VLANs into a data structure where VIDs can be looked up by name
 vlans = {x["name"]: x["id"] for x in config["vlans"]}
+
+# function to set layer 3 addresses on an interface
+def set_addresses(ifname, declared_addresses):
+    current_addresses = filter(lambda x: x["ifname"] == ifname, ndb.addresses.summary())
+    current_addresses = set(map(lambda x: f"{x['address']}/{x['prefixlen']}", current_addresses))
+
+    # remove configured IPs that should no longer be there
+    for address in (current_addresses - declared_addresses):
+        # skip ipv6 link local addresses
+        if address.startswith("fe80::"):
+            continue
+        (ndb.interfaces[ifname]
+            .del_ip(address)
+            .commit()
+        )
+        print(f"Removed address {address} from interface {ifname}")
+    # add any IPs that are declared but not present
+    for address in (declared_addresses - current_addresses):
+        (ndb.interfaces[ifname]
+            .add_ip(address)
+            .commit()
+        )
+        print(f"Added address {address} to interface {ifname}")
 
 # configure the switchports
 # NDB does not support VLAN filters at this time, so that step
@@ -254,6 +289,12 @@ for interface in config["interfaces"]:
                     vlan_info={"flags": vlan_info[0], "vid": vlan_info[1]},
                 )
                 print(f"Added {description} VLAN {vlan_info[1]} to interface {interface['name']}")
+    else:
+        # it's an L3 port
+        # get the declared addresses and then set them
+        declared_addresses = set(interface["l3"]["ipv4"] if "ipv4" in interface["l3"] else [])
+        declared_addresses.update(interface["l3"]["ipv6"] if "ipv6" in interface["l3"] else [])
+        set_addresses(interface["name"], declared_addresses)
 
     # configure the up/down state
     # default to down if not specified
@@ -265,5 +306,38 @@ for interface in config["interfaces"]:
             .commit()
         )
         print(f"Set interface {interface['name']} state to {state}")
+
+
+# go through the VLANs and check if any have L3 configurations
+# if so, create the necessary VLAN interfaces
+for vlan in config["vlans"]:
+    l3_name = f"vlan{vlan['id']}"
+    if "ipv4" in vlan or "ipv6" in vlan:
+        bridge_name = vlan["virtual_switch"] if "virtual_switch" in vlan else "default-switch"
+        if l3_name not in ndb.interfaces:
+            (ndb.interfaces
+                .create(
+                    ifname=l3_name,
+                    link=bridge_name,
+                    kind="vlan",
+                    vlan_id=vlan["id"],
+                    state="up"
+                )
+                .commit()
+            )
+            print(f"Created layer 3 interface {l3_name} for VLAN {vlan['id']}")
+        else:
+            if ndb.interfaces[l3_name]["state"] != "up":
+                (ndb.interfaces[l3_name]
+                    .set("state", "up")
+                    .commit()
+                )
+                print(f"Enabled layer 3 interface {l3_name} for VLAN {vlan['id']}")
+
+        # set the actual L3 addresses
+        declared_addresses = set(vlan["ipv4"] if "ipv4" in vlan else [])
+        declared_addresses.update(vlan["ipv6"] if "ipv6" in vlan else [])
+        set_addresses(l3_name, declared_addresses)
+
 
 ndb.close()
