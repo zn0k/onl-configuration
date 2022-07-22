@@ -3,6 +3,7 @@
 import yaml
 from pyroute2 import NDB, IPRoute
 import argparse
+import sys
 
 parser = argparse.ArgumentParser(description="Configure ONL device interfaces and routing")
 parser.add_argument("--config", type=str, help="Configuration file to load", default="config.yml")
@@ -12,6 +13,70 @@ ndb = NDB()
 
 with open(args.config, "r") as f:
     config = yaml.load(f, Loader=yaml.Loader)
+
+# interfaces that shouldn't be touched, ever
+do_not_touch = ["lo", "dummy0", "sit0"]
+# check that none of those are part of the config
+for interface in config["interfaces"]:
+    found_bad = False
+    if interface["name"] in do_not_touch:
+        found_bad = True
+        print(f"Invalid interface {interface['name']} in configuration file")
+    if found_bad:
+        sys.exit(1)
+    
+
+# add the mgmt IP address configuration to either the VLANs or the physical interfaces
+if "mgmt_ip" in config:
+    if "vlan" in config["mgmt_ip"]:
+        found = False
+        for vlan in config["vlans"]:
+            if vlan["id"] == config["mgmt_ip"]["vlan"]:
+                found = True
+                if "ipv4" in vlan:
+                    if config["mgmt_ip"]["ipv4"] not in vlan["ipv4"]:
+                        vlan["ipv4"].append(config["mgmt_ip"]["ipv4"])
+                else:
+                    vlan["ipv4"] = [config["mgmt_ip"]["ipv4"]]
+        if not found:
+            config["vlans"].append(
+                {
+                    "name": "netmgmt",
+                    "id": config["mgmt_ip"]["vlan"],
+                    "ipv4": [config["mgmt_ip"]["ipv4"]],
+                }
+            )
+    else:
+        found = False
+        for interface in config["interfaces"]:
+            if interface["name"] == config["mgmt_ip"]["interface"]:
+                found = True
+                if "l3" in interface:
+                    if "ipv4" in interface:
+                        if config["mgmt_ip"]["ipv4"] not in interface["l3"]["ipv4"]:
+                            interface["l3"]["ipv4"].append(config["mgmt_ip"]["ipv4"])
+                        else:
+                            interface["l3"]["ipv4"] = [config["mgmt_ip"]["ipv4"]]
+                else:
+                    interface["l3"] = {"ipv4": [config["mgmt_ip"]["ipv4"]]}
+        if not found:
+            config["interfaces"].append(
+                {
+                    "name": config["mgmt_ip"]["interface"],
+                    "enabled": True,
+                    "l3": {
+                        "ipv4": [config["mgmt_ip"]["ipv4"]],
+                    },
+                }
+            )
+
+# cache some information that will be useful later
+# fetch information on all VLANs and IP addresses on interfaces,
+# store interfaces have IP or VLANs into sets
+interfaces_with_vlans = set(map(lambda x: x.ifname, ndb.vlans.summary()))
+interfaces_with_ips = set(map(lambda x: x.ifname, ndb.addresses.summary()))
+# create a lookup table for interface admin states
+admin_state = {x.ifname: x.state for x in ndb.interfaces.dump()}
 
 # configure LACP bundles
 # parse the interface configuration for such bundles,
@@ -113,7 +178,7 @@ for bundle in lacp_config:
         # now add all the members
         for member in members_to_add:
             # for this, the new member has to be down
-            previous_state = ndb.interfaces[member]["state"]
+            previous_state = admin_state[member]
             if previous_state != "down":
                 (ndb
                     .interfaces[member]
@@ -167,7 +232,7 @@ for virtual_switch in virtual_switches:
         print(f"Created VLAN capable switch {virtual_switch}")
     else:
         # if the bridge already exists, ensure the interface is up
-        if ndb.interfaces[virtual_switch]["state"] != "up":
+        if admin_state[virtual_switch] != "up":
             (ndb
                 .interfaces[virtual_switch]
                 .set("state", "up")
@@ -222,6 +287,33 @@ def set_addresses(ifname, declared_addresses):
         )
         print(f"Added address {address} to interface {ifname}")
 
+def set_vlans(ifname, declared_vlans):
+    # retrieve the current untagged and tagged VLANs for the interface
+    current_vlans = get_vlans(ifname)
+    # turn them into a set of tuples so they can be used in set operations
+    current_vlans = set(map(lambda x: (x["flags"], x["vid"]), current_vlans))
+    # get the interface index
+    interface_idx = ndb.interfaces[ifname]["index"]
+
+    # remove any unneeded configuration
+    for flags, vlan_id in (current_vlans - declared_vlans):
+        ipr.vlan_filter(
+            "del",
+            index=interface_idx,
+            vlan_info={"flags": flags, "vid": vlan_id},
+        )
+        description = "untagged" if flags == 6 else "tagged"
+        print(f"Removed {description} VLAN {vlan_id} from interface {interface['name']}")
+    # and add the new one
+    for flags, vlan_id in (declared_vlans - current_vlans):
+        ipr.vlan_filter(
+            "add",
+            index=interface_idx,
+            vlan_info={"flags": flags, "vid": vlan_id},
+        )
+        description = "untagged" if flags == 6 else "tagged"
+        print(f"Added {description} VLAN {vlan_id} to interface {interface['name']}")
+
 # configure the switchports
 # NDB does not support VLAN filters at this time, so that step
 # has to be performed via the IPRoute interface instead
@@ -231,9 +323,6 @@ for interface in config["interfaces"]:
     # force skipping LACP members
     if interface["name"] in lacp_members:
         continue
-
-    # get the interface index for easy access in later operations
-    interface_idx = ndb.interfaces[interface["name"]]["index"]
 
     # check if the interface is a layer 2 port
     if "l3" not in interface:
@@ -256,39 +345,13 @@ for interface in config["interfaces"]:
             if interface["voice_vlan"] not in tagged_vlans:
                 tagged_vlans.append(interface["voice_vlan"])
 
-        # retrieve the current untagged and tagged VLANs for the interface
-        current_vlans = get_vlans(interface["name"])
-        # turn them into a set of tuples so they can be used in sets
-        current_vlans = list(map(lambda x: (x["flags"], x["vid"]), current_vlans))
+        if "untagged_vlan" in interface:
+            declared_vlans = set([(6, vlans[interface["untagged_vlan"]])])
+        else:
+            declared_vlans = set()
+        declared_vlans.update(set([(0, vlans[x]) for x in tagged_vlans]))
 
-        for mode in [(6, "untagged_vlan"), (0, "tagged_vlans")]:
-            description = mode[1].replace("_vlans", "").replace("_vlan", "")
-            # fetch what is currenly in place
-            current = set(filter(lambda x: x[0] == mode[0], current_vlans))
-            if mode[1] in interface:
-                if mode[1] == "untagged_vlan":
-                    declared = set([(6, vlans[interface["untagged_vlan"]])])
-                else:
-                    declared = set([(0, vlans[x]) for x in tagged_vlans])
-                declared = set(declared)
-            else:
-                declared = set()
-            # remove any unneeded configuration
-            for vlan_info in (current - declared):
-                ipr.vlan_filter(
-                    "del",
-                    index=interface_idx,
-                    vlan_info={"flags": vlan_info[0], "vid": vlan_info[1]},
-                )
-                print(f"Removed {description} VLAN {vlan_info[1]} from interface {interface['name']}")
-            # and add the new one
-            for vlan_info in (declared - current):
-                ipr.vlan_filter(
-                    "add",
-                    index=interface_idx,
-                    vlan_info={"flags": vlan_info[0], "vid": vlan_info[1]},
-                )
-                print(f"Added {description} VLAN {vlan_info[1]} to interface {interface['name']}")
+        set_vlans(interface["name"], declared_vlans)
     else:
         # it's an L3 port
         # get the declared addresses and then set them
@@ -299,7 +362,7 @@ for interface in config["interfaces"]:
     # configure the up/down state
     # default to down if not specified
     state = "up" if "enabled" in interface and interface["enabled"] else "down"
-    if ndb.interfaces[interface["name"]]["state"] != state:
+    if admin_state[interface["name"]] != state:
         (ndb
             .interfaces[interface["name"]]
             .set("state", state)
@@ -310,34 +373,103 @@ for interface in config["interfaces"]:
 
 # go through the VLANs and check if any have L3 configurations
 # if so, create the necessary VLAN interfaces
-for vlan in config["vlans"]:
+# first, get the list of L3 VLANs
+l3_vlans = [vlan for vlan in config["vlans"] if "ipv4" in vlan or "ipv6" in vlan]
+# keep track of the virtual switches, and the VLANs associated with them
+bridges = {}
+for vlan in l3_vlans:
     l3_name = f"vlan{vlan['id']}"
-    if "ipv4" in vlan or "ipv6" in vlan:
-        bridge_name = vlan["virtual_switch"] if "virtual_switch" in vlan else "default-switch"
-        if l3_name not in ndb.interfaces:
-            (ndb.interfaces
-                .create(
-                    ifname=l3_name,
-                    link=bridge_name,
-                    kind="vlan",
-                    vlan_id=vlan["id"],
-                    state="up"
-                )
+    bridge_name = vlan["virtual_switch"] if "virtual_switch" in vlan else "default-switch"
+    # remember the VLAN against its bridge 
+    if bridge_name in bridges:
+        bridges[bridge_name].append(vlan["id"])
+    else:
+        bridges[bridge_name] = [vlan["id"]]
+
+    # create the L3 interface if it does not exist    
+    if l3_name not in ndb.interfaces:
+        (ndb.interfaces
+            .create(
+                ifname=l3_name,
+                link=bridge_name,
+                kind="vlan",
+                vlan_id=vlan["id"],
+                state="up"
+            )
+            .commit()
+        )
+        print(f"Created layer 3 interface {l3_name} for VLAN {vlan['id']}")
+    else:
+        # it exists already, make sure it's up
+        if admin_state[l3_name] != "up":
+            (ndb.interfaces[l3_name]
+                .set("state", "up")
                 .commit()
             )
-            print(f"Created layer 3 interface {l3_name} for VLAN {vlan['id']}")
-        else:
-            if ndb.interfaces[l3_name]["state"] != "up":
-                (ndb.interfaces[l3_name]
-                    .set("state", "up")
-                    .commit()
-                )
-                print(f"Enabled layer 3 interface {l3_name} for VLAN {vlan['id']}")
+            print(f"Enabled layer 3 interface {l3_name} for VLAN {vlan['id']}")
 
-        # set the actual L3 addresses
-        declared_addresses = set(vlan["ipv4"] if "ipv4" in vlan else [])
-        declared_addresses.update(vlan["ipv6"] if "ipv6" in vlan else [])
-        set_addresses(l3_name, declared_addresses)
+    # and finally set the actual L3 addresses
+    declared_addresses = set(vlan["ipv4"] if "ipv4" in vlan else [])
+    declared_addresses.update(vlan["ipv6"] if "ipv6" in vlan else [])
+    set_addresses(l3_name, declared_addresses)
 
+# now go through the bridges and make sure the L3 VLANs are present as 'self'
+# this is needed for the VLAN interface to be reachable
+for bridge_name, declared in bridges.items():
+    # turn the list of declared VLANs into a set of tuples
+    declared = set([(0, vid) for vid in declared])
+    # fetch the current VLANs on the bridge
+    # turn them into a set of tuples so they can be used in set operations
+    current = set(map(lambda x: (x["flags"], x["vid"]), get_vlans(bridge_name)))
+    # look up the bridge interface ID
+    interface_idx = ndb.interfaces[bridge_name]["index"]
+    # remove the unneeded VLANs
+    for flags, vlan_id in (current - declared):
+        ipr.vlan_filter(
+            "del",
+            index=interface_idx,
+            vlan_info={"flags": flags, "vid": vlan_id},
+            vlan_flags="self",
+        )
+        print(f"Removed L3 VLAN {vlan_id} from bridge {bridge_name}")
+    # and add the new one
+    for flags, vlan_id in (declared - current):
+        ipr.vlan_filter(
+            "add",
+            index=interface_idx,
+            vlan_info={"flags": flags, "vid": vlan_id},
+            vlan_flags="self",
+        )
+        print(f"Added L3 VLAN {vlan_id} to bridge {bridge_name}")
+
+# handle interfaces that exist on the system but were not explicitly configured
+# first, collect all names of existing interfaces
+existing_interfaces = set(map(lambda x: x.ifname, ndb.interfaces.summary()))
+# but ignore the system interfaces that shouldn't be touched
+existing_interfaces -= set(do_not_touch)
+# also subtract the virtual switches
+existing_interfaces -= set(virtual_switches)
+# subtract all physical interfaces that were explicitly configured
+existing_interfaces -= set(map(lambda x: x["name"], config["interfaces"]))
+# subtract all VLAN L3 interfaces that were explicitly configured
+existing_interfaces -= set(map(lambda x: f"vlan{x['id']}", l3_vlans))
+# subtract the declared LACP bundles
+existing_interfaces -= declared_bundles
+
+for interface in existing_interfaces:
+    # set the interface state to admin down
+    if admin_state[interface] != "down":
+        (ndb
+            .interfaces[interface]
+            .set("state", "down")
+            .commit()
+        )
+        print(f"Set unconfigured interface {interface} state to down")
+    # remove L3 information by declaring no addresses, if needed
+    if interface in interfaces_with_ips:
+        set_addresses(interface, set())
+    # remove VLANs by declaring none, if needed
+    if interface in interfaces_with_vlans:
+        set_vlans(interface, set())
 
 ndb.close()
